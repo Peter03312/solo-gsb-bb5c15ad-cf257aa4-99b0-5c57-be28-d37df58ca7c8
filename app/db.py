@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS reschedules (
     new_pool_remaining_quota INTEGER,             -- 新池占用后的剩余快照；无池/被拒为 NULL
     decision        TEXT    NOT NULL CHECK (decision IN ('approved', 'rejected')),
     reject_reason   TEXT,                         -- 无法核准时的既有拒绝原因
+    copy_conflicts_json TEXT,                     -- 拷贝冲突被拒时的冲突快照 JSON（COPY_CONFLICT）
     reason          TEXT,                         -- 运营方填写的改签原因（可选）
     rescheduled_at  TEXT    NOT NULL
 );
@@ -127,6 +128,36 @@ CREATE INDEX IF NOT EXISTS idx_reschedules_verification
     ON reschedules (verification_id, decision, id);
 CREATE INDEX IF NOT EXISTS idx_reschedules_key
     ON reschedules (idempotency_key, id);
+
+-- 实体放映拷贝：同片拷贝数量有限，授权额度足够也可能无法同时运抵场馆。
+-- 影片在**尚无核准流水**时由运营方登记：正整数片长（分钟）、非负跨场馆
+-- 转运分钟数与全局唯一拷贝编号；同一影片后续追加的拷贝片长/转运分钟数
+-- 必须与首次登记一致。已配置拷贝的影片，其核准场次在领取开场码前必须
+-- 持有有效分配；未配置拷贝的影片沿用旧行为。
+CREATE TABLE IF NOT EXISTS copies (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    film_id          TEXT    NOT NULL,
+    copy_code        TEXT    NOT NULL UNIQUE,       -- 运营方给定的唯一拷贝编号
+    duration_minutes INTEGER NOT NULL CHECK (duration_minutes >= 1),
+    transport_minutes INTEGER NOT NULL CHECK (transport_minutes >= 0),
+    note             TEXT,
+    created_at       TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_copies_film ON copies (film_id);
+
+-- 拷贝分配：每条核准流水至多一条当前分配（verification_id 唯一约束兜底，
+-- 并发分配/换拷贝不可能超订）。取消场次不删行——占用经 cancellations
+-- 派生排除（分配视为已释放，行保留可追溯）；改签不换场馆，分配随当前
+-- 排片自动迁移到新时刻，占用一律按"最近成功改签后的当前开场时刻"计算。
+CREATE TABLE IF NOT EXISTS copy_assignments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL UNIQUE REFERENCES verifications (id),
+    idempotency_key TEXT    NOT NULL UNIQUE,
+    copy_id         INTEGER NOT NULL REFERENCES copies (id),
+    assigned_at     TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_copy_assignments_copy
+    ON copy_assignments (copy_id);
 """
 
 # Columns added after the initial release; applied lazily so databases
@@ -138,6 +169,10 @@ _EXTRA_COLUMNS = {
     "verifications": [
         ("pool_id", "INTEGER REFERENCES quota_pools (id)"),
         ("pool_remaining_quota", "INTEGER"),
+    ],
+    "reschedules": [
+        # 因拷贝冲突被拒的改签：冲突快照 JSON 随记录留存，重放返回同样内容
+        ("copy_conflicts_json", "TEXT"),
     ],
 }
 

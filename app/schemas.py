@@ -229,6 +229,12 @@ class CurrentVerificationOut(VerificationOut):
     last_reschedule: Optional[LastRescheduleBrief] = Field(
         description="最近一次成功改签摘要；从未改签为 null"
     )
+    copy_code: Optional[str] = Field(
+        description="当前分配的实体放映拷贝编号；未分配（含未配置拷贝的影片）为 null"
+    )
+    copy_released: bool = Field(
+        description="true 表示场次已取消、拷贝分配已释放（行保留留痕）"
+    )
 
 
 class BatchVerifyResponse(BaseModel):
@@ -256,6 +262,10 @@ class CancelOut(BaseModel):
     pool_id: Optional[int] = Field(description="同步释放一次的共享池 id；授权未绑池为 null")
     reason: str
     cancelled_at: str = Field(description="取消登记时间（UTC）")
+    copy_code: Optional[str] = Field(
+        default=None,
+        description="取消时一并释放的拷贝分配编号（该场次已分配拷贝时非空）"
+    )
     replay: bool = Field(
         description="true 表示重复提交同一取消，返回首次记录，未重复释放额度"
     )
@@ -310,6 +320,10 @@ class RescheduleOut(BaseModel):
     )
     reason: Optional[str] = Field(description="运营方填写的改签原因")
     rescheduled_at: str = Field(description="改签登记时间（UTC）")
+    copy_conflicts: Optional[list["CopyConflictOut"]] = Field(
+        default=None,
+        description="reject_reason=COPY_CONFLICT 时附冲突场次快照；其他情况为 null"
+    )
     replay: bool = Field(
         description="true 表示同操作键同内容重放，返回首次记录，未重复迁移"
     )
@@ -374,4 +388,132 @@ class RedemptionOut(BaseModel):
     replay: bool = Field(description="true 表示重复核销返回首次回执，不重复记场次")
 
 
+# ----------------------------------------------------------------------
+# 实体放映拷贝（physical copies）登记 / 分配 / 占用冲突
+# ----------------------------------------------------------------------
+class CopyRegisterRequest(BaseModel):
+    """运营方登记一份实体放映拷贝。
+
+    影片在尚无核准流水时登记；同片追加拷贝的片长/转运分钟数须与首次一致。
+    """
+
+    film_id: str = Field(min_length=1, max_length=128, examples=["film-autumn-river"])
+    copy_code: str = Field(
+        min_length=1, max_length=128,
+        description="唯一拷贝编号（全库唯一，运营方给定）",
+        examples=["print-AKR-001"],
+    )
+    duration_minutes: int = Field(
+        ge=1, le=1_000_000,
+        description="正整数片长（分钟）",
+        examples=[118],
+    )
+    transport_minutes: int = Field(
+        ge=0, le=1_000_000,
+        description="非负跨场馆转运分钟数（同片一致）",
+        examples=[45],
+    )
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class CopyOccupancyOut(BaseModel):
+    """一份拷贝的当前占用：未取消的已分配核准场次，按当前排片计时。"""
+
+    idempotency_key: str = Field(description="占用该拷贝的场次幂等键")
+    venue_id: str = Field(description="当前排片场馆（改签不改场馆）")
+    start_time: str = Field(description="当前排片开场时刻（UTC）")
+    end_time: str = Field(description="占用结束 = 开场 + 片长（UTC，不含）")
+    ready_time: str = Field(
+        description="拷贝最早可在另一场馆开演的时刻 = 结束 + 跨场馆转运分钟（UTC）"
+    )
+
+
+class CopyOut(BaseModel):
+    id: int = Field(description="拷贝编号（库内自增 id）")
+    film_id: str = Field(description="所属影片")
+    copy_code: str = Field(description="唯一拷贝编号")
+    duration_minutes: int = Field(description="片长（分钟，正整数）")
+    transport_minutes: int = Field(description="跨场馆转运分钟数（非负）")
+    note: Optional[str]
+    created_at: str
+    used_sessions: int = Field(description="当前持有该拷贝分配的未取消核准场次数")
+    occupancies: Optional[list[CopyOccupancyOut]] = Field(
+        default=None,
+        description="当前占用该拷贝的场次（按开场时刻升序）；仅单拷贝详情返回",
+    )
+
+
+class CopyAssignmentRequest(BaseModel):
+    """为已核准、未取消、未开场的场次指定一份同片拷贝。"""
+
+    copy_code: str = Field(
+        min_length=1, max_length=128,
+        description="同片拷贝的唯一编号",
+        examples=["print-AKR-001"],
+    )
+
+
+class CopyConflictOut(BaseModel):
+    """与目标时段相冲突的一场既有拷贝占用（按当前排片）。"""
+
+    idempotency_key: str = Field(description="冲突场次的幂等键")
+    venue_id: str = Field(description="冲突场馆（与目标相同=同场馆时段重叠；不同=转运不达标）")
+    start_time: str = Field(description="冲突场次当前开场时刻（UTC）")
+    end_time: str = Field(description="冲突场次占用结束（开场+片长，UTC）")
+    relation: Literal["same_venue_overlap", "cross_venue_transport"] = Field(
+        description="同场馆时段重叠 / 跨场馆转运时间不足"
+    )
+
+
+class CopyAssignmentOut(BaseModel):
+    idempotency_key: str = Field(description="场次原核验幂等键")
+    copy_code: str = Field(description="当前分配到的拷贝编号")
+    film_id: str
+    venue_id: str = Field(description="场次场馆（当前排片）")
+    start_time: str = Field(description="场次当前开场时刻（UTC）")
+    assigned_at: str = Field(description="首次分配登记时间（UTC）")
+    replaced: bool = Field(description="true 表示本次在同一事务内原子替换了原拷贝")
+    released: bool = Field(description="true 表示该场次已取消，分配不再占用拷贝（保留留痕）")
+    replay: bool = Field(
+        description="true 表示同场次同拷贝重试，返回现状（不产生新的分配/替换）"
+    )
+
+
+class CopyAssignmentStatusOut(BaseModel):
+    idempotency_key: str
+    assigned: bool = Field(description="是否存在分配记录（含已取消后保留的留痕）")
+    copy_code: Optional[str] = Field(description="当前/留痕的拷贝编号；从未分配为 null")
+    assigned_at: Optional[str]
+    released: bool = Field(description="场次已取消，分配已释放（行保留留痕）")
+
+
+class CopyConflictProbeRequest(BaseModel):
+    """拷贝占用冲突探针：不写任何分配，只返回目标时段的冲突场次。"""
+
+    film_id: str = Field(min_length=1, max_length=128)
+    copy_code: str = Field(min_length=1, max_length=128)
+    venue_id: str = Field(min_length=1, max_length=128)
+    start_time: datetime = Field(
+        description="拟开场时间，ISO-8601；不带时区时按 UTC 处理",
+        examples=["2026-10-10T19:30:00Z"],
+    )
+    exclude_idempotency_key: Optional[str] = Field(
+        default=None,
+        description="可选：模拟改签/换拷贝时排除本场自身（其占用视为先释放）",
+    )
+
+
+class CopyConflictProbeOut(BaseModel):
+    film_id: str
+    copy_code: str
+    venue_id: str
+    start_time: str
+    duration_minutes: int
+    transport_minutes: int
+    conflict: bool = Field(description="目标时段是否与既有占用冲突")
+    conflicts: list[CopyConflictOut] = Field(description="冲突场次列表（按开场升序）")
+
+
+CopyOut.model_rebuild()
 OpeningCodeStatusOut.model_rebuild()
+RescheduleOut.model_rebuild()

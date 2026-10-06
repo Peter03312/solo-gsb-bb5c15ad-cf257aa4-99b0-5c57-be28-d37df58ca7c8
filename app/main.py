@@ -15,6 +15,14 @@ from .schemas import (
     BatchVerifyResponse,
     CancelOut,
     CancelRequest,
+    CopyAssignmentOut,
+    CopyAssignmentRequest,
+    CopyAssignmentStatusOut,
+    CopyConflictProbeOut,
+    CopyConflictProbeRequest,
+    CopyOccupancyOut,
+    CopyOut,
+    CopyRegisterRequest,
     CurrentVerificationOut,
     LicenseCreate,
     LicenseOut,
@@ -75,8 +83,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.5.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销与核准场次改签",
+        version="1.6.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销、核准场次改签与实体放映拷贝登记/分配/占用冲突",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -97,10 +105,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.exception_handler(UnprocessableError)
     async def _unprocessable_handler(request: Request, exc: UnprocessableError):
-        return JSONResponse(
-            status_code=422,
-            content={"detail": str(exc), "code": exc.code},
-        )
+        content = {"detail": str(exc), "code": exc.code}
+        if exc.extra:
+            content.update(exc.extra)
+        return JSONResponse(status_code=422, content=content)
 
     # ------------------------------------------------------------------
     # meta
@@ -109,7 +117,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.5.0",
+            "version": "1.6.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -332,10 +340,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
           新时间非未来 422 NEW_START_NOT_IN_FUTURE，与当前相同 422
           NEW_START_UNCHANGED，均不留改签记录；
         - 每次改签都按新时间**重新判定**授权/暂停/撤销与所绑共享池额度，当前占用
-          视为先释放后参与可用额度；无法核准时返回**既有拒绝原因**
-          （decision=rejected），排片与占用不变，并落一条可追溯、可幂等重放的
-          改签流水；
-        - 成功后原授权及池占用各释放一次、新授权及池占用各增加一次；保留改签历史，
+          视为先释放后参与可用额度；**已持有实体拷贝分配的场次还在同一事务内重检
+          拷贝占用**（同场馆重叠/跨场馆转运不达标）；无法核准时返回**既有拒绝原因**
+          （decision=rejected，授权类原因或 COPY_CONFLICT 并附 copy_conflicts），
+          排片、拷贝分配与占用均不变，并落一条可追溯、可幂等重放的改签流水；
+        - 成功后原授权及池占用各释放一次、新授权及池占用各增加一次（拷贝分配不变，
+          自动按新时刻占用）；保留改签历史，
           GET /verifications 返回当前排片；
         - 同操作键同内容重放返回首次记录（replay=true，不重复迁移），同操作键异
           内容（或用于另一核验）返回 409；
@@ -394,6 +404,92 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         return store.cancel_verification(idempotency_key, reason=body.reason)
 
     # ------------------------------------------------------------------
+    # physical film copies: registry, assignment, occupancy & conflicts
+    # ------------------------------------------------------------------
+    @app.post("/copies", response_model=CopyOut, status_code=201, tags=["copies"])
+    def register_copy(body: CopyRegisterRequest):
+        """为影片登记一份实体放映拷贝（唯一拷贝编号 + 正整数片长 + 非负跨场馆转运分钟）。
+
+        - 影片**尚无任何核准流水**时方可登记（已有 approved 流水，即使随后
+          取消，也返回 422 COPY_FILM_ALREADY_IN_USE）；编号全库唯一，重复
+          返回 422 COPY_CODE_TAKEN；同片追加拷贝的片长/转运分钟数必须与
+          首次登记一致，否则 422 COPY_METADATA_MISMATCH；
+        - 拷贝占用按当前排片计为 [开场, 开场+片长)：同场馆半开区间不重叠，
+          跨场馆两场之间须留足转运时间（双向校验，恰好满足边界可用）。
+        """
+        return store.register_copy(
+            film_id=body.film_id,
+            copy_code=body.copy_code,
+            duration_minutes=body.duration_minutes,
+            transport_minutes=body.transport_minutes,
+            note=body.note,
+        )
+
+    @app.get("/copies", response_model=list[CopyOut], tags=["copies"])
+    def list_copies(film_id: Optional[str] = Query(default=None)):
+        """列出全部实体拷贝（含当前占用场次数），可按 film_id 过滤。"""
+        return store.list_copies(film_id=film_id)
+
+    @app.post(
+        "/copies/conflicts",
+        response_model=CopyConflictProbeOut,
+        tags=["copies"],
+    )
+    def probe_copy_conflicts(body: CopyConflictProbeRequest):
+        """只读冲突探针：给定拷贝/场馆/拟开场时间，返回冲突场次，不写任何分配。
+
+        可传 ``exclude_idempotency_key`` 模拟改签/换拷贝时本场占用先释放。
+        """
+        return store.probe_copy_conflicts(
+            film_id=body.film_id,
+            copy_code=body.copy_code,
+            venue_id=body.venue_id,
+            start_time=body.start_time,
+            exclude_idempotency_key=body.exclude_idempotency_key,
+        )
+
+    @app.get("/copies/{copy_code}", response_model=CopyOut, tags=["copies"])
+    def get_copy(copy_code: str):
+        """单份拷贝详情，含当前占用列表（按开场时刻升序）。"""
+        return store.get_copy(copy_code)
+
+    @app.get(
+        "/copies/{copy_code}/occupancies",
+        response_model=list[CopyOccupancyOut],
+        tags=["copies"],
+    )
+    def list_copy_occupancies(copy_code: str):
+        """查询一份拷贝当前的占用场次（未取消的已分配核准场次）。"""
+        return store.list_copy_occupancies(copy_code)
+
+    @app.post(
+        "/verifications/{idempotency_key}/copy-assignment",
+        response_model=CopyAssignmentOut,
+        tags=["copies"],
+    )
+    def assign_copy(idempotency_key: str, body: CopyAssignmentRequest):
+        """为已核准、未取消、未开场的场次指定一份同片实体拷贝。
+
+        - 同场馆时段重叠或跨场馆转运不达标 → 422 COPY_CONFLICT（附
+          ``conflicts`` 冲突场次），**冲突不落账**：不写/不改分配；
+        - 同场次同拷贝重试 → 返回现状（replay=true）；换拷贝在同一事务
+          内原子替换：新拷贝冲突则原分配原样保留（replaced=false）；
+        - 未知键 404；已拒绝 422 VERIFICATION_NOT_APPROVED；已取消 422
+          SESSION_CANCELLED；已开场 422 SESSION_ALREADY_STARTED；拷贝不存在
+          422 COPY_NOT_FOUND；拷贝他片 422 COPY_FILM_MISMATCH。
+        """
+        return store.assign_copy(idempotency_key, copy_code=body.copy_code)
+
+    @app.get(
+        "/verifications/{idempotency_key}/copy-assignment",
+        response_model=CopyAssignmentStatusOut,
+        tags=["copies"],
+    )
+    def get_copy_assignment_status(idempotency_key: str):
+        """查询场次的拷贝分配状态（从未分配/当前拷贝/取消后已释放留痕）。"""
+        return store.get_assignment_status(idempotency_key)
+
+    # ------------------------------------------------------------------
     # one-time opening codes (operator claim / status) and venue redemption
     # ------------------------------------------------------------------
     @app.post(
@@ -405,7 +501,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         """运营方按原核验幂等键为核准场次领取一次性开场码。
 
         - 仅已核准（approved）、未取消且未到计划开场时刻的场次可领取；
-          未知键 404，已拒绝 422 VERIFICATION_NOT_APPROVED，已取消 422
+          **已配置实体拷贝的影片还须已持有有效拷贝分配**（422
+          COPY_NOT_ASSIGNED），未配置拷贝的影片沿用旧行为；未知键 404，
+          已拒绝 422 VERIFICATION_NOT_APPROVED，已取消 422
           SESSION_CANCELLED，已开场 422 SESSION_ALREADY_STARTED，均不产生码；
         - 每场仅有一个码：首次领取返回原码（replay=false），重复领取只返回
           状态（replay=true，code=null），原码不会再次泄露；
