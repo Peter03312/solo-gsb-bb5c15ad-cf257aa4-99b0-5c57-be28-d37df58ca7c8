@@ -127,6 +127,39 @@ CREATE INDEX IF NOT EXISTS idx_reschedules_verification
     ON reschedules (verification_id, decision, id);
 CREATE INDEX IF NOT EXISTS idx_reschedules_key
     ON reschedules (idempotency_key, id);
+
+-- 影片级实体拷贝配置：每部影片至多一条；仅可在该影片尚无核准流水时随首份
+-- 拷贝登记建立，此后不可改。片长决定每份拷贝按当前排片的占用区间
+-- [开场, 开场+片长)；转运分钟数是跨场馆两场之间必须预留的最小间隔
+-- （同场馆视为 0，恰好满足边界可用）。
+CREATE TABLE IF NOT EXISTS film_copy_profiles (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    film_id          TEXT    NOT NULL UNIQUE,      -- 每部影片至多一条拷贝配置
+    duration_minutes INTEGER NOT NULL CHECK (duration_minutes >= 1),  -- 正整数片长
+    transfer_minutes INTEGER NOT NULL CHECK (transfer_minutes >= 0),  -- 非负跨场馆转运分钟
+    created_at       TEXT    NOT NULL
+);
+
+-- 实体放映拷贝：copy_code 全库唯一；同片各拷贝共享影片级片长与转运配置。
+CREATE TABLE IF NOT EXISTS film_copies (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    film_id    TEXT    NOT NULL,
+    copy_code  TEXT    NOT NULL UNIQUE,            -- 唯一拷贝编号
+    created_at TEXT    NOT NULL
+);
+
+-- 场次拷贝分配：每个核验场次至多一条当前分配（verification_id 唯一约束兜底
+-- 并发分配）。占用区间不落地，由场次的当前排片（含改签）+ 影片片长实时派生，
+-- 改签成功后占用自动跟随新时段；取消场次在同一事务删除本行即释放；
+-- 换拷贝在同一事务内 UPDATE 本行完成原子替换。
+CREATE TABLE IF NOT EXISTS copy_assignments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL UNIQUE REFERENCES verifications (id),
+    copy_id         INTEGER NOT NULL REFERENCES film_copies (id),
+    assigned_at     TEXT    NOT NULL               -- 最近一次（重）分配时间
+);
+CREATE INDEX IF NOT EXISTS idx_copy_assignments_copy
+    ON copy_assignments (copy_id);
 """
 
 # Columns added after the initial release; applied lazily so databases

@@ -375,3 +375,159 @@ class RedemptionOut(BaseModel):
 
 
 OpeningCodeStatusOut.model_rebuild()
+
+
+# ----------------------------------------------------------------------
+# 实体放映拷贝：影片级配置登记 / 拷贝查询 / 场次分配
+# ----------------------------------------------------------------------
+class CopyRegisterRequest(BaseModel):
+    """登记一份实体拷贝；同片首份拷贝同时固定影片级片长与转运配置。"""
+
+    duration_minutes: int = Field(
+        ge=1, le=100_000,
+        description="正整数片长（分钟）；每份拷贝按当前排片占用 [开场, 开场+片长)",
+        examples=[120],
+    )
+    transfer_minutes: int = Field(
+        ge=0, le=100_000,
+        description="非负跨场馆转运分钟数；跨场馆两场之间须留足该间隔，恰好满足边界可用",
+        examples=[45],
+    )
+    copy_code: str = Field(
+        min_length=1, max_length=128,
+        description="唯一拷贝编号（全库唯一）",
+        examples=["COPY-AR-001"],
+    )
+
+    @field_validator("copy_code")
+    @classmethod
+    def _code_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("copy_code must not be blank")
+        return value
+
+
+class CopyOut(BaseModel):
+    id: int = Field(description="拷贝记录编号")
+    film_id: str
+    copy_code: str = Field(description="唯一拷贝编号")
+    duration_minutes: int = Field(description="影片级片长（分钟）")
+    transfer_minutes: int = Field(description="影片级跨场馆转运分钟数")
+    created_at: str = Field(description="登记时间（UTC）")
+    replay: bool = Field(
+        description="true 表示同编号同参数重复登记，返回既有记录，未新建拷贝"
+    )
+
+
+class CopyBrief(BaseModel):
+    id: int
+    copy_code: str
+    created_at: str
+
+
+class FilmCopiesOut(BaseModel):
+    """某部影片的拷贝配置与拷贝清单；未配置时 configured=false。"""
+
+    film_id: str
+    configured: bool = Field(
+        description="是否已配置实体拷贝；未配置的影片领开场码沿用旧行为（无需分配）"
+    )
+    duration_minutes: Optional[int] = Field(description="片长（分钟）；未配置为 null")
+    transfer_minutes: Optional[int] = Field(description="跨场馆转运分钟数；未配置为 null")
+    copies: list[CopyBrief]
+
+
+class CopyOccupancyItem(BaseModel):
+    """一份拷贝当前占用的一场：占用区间 [start_time, end_time) 按当前排片派生。"""
+
+    verification_id: int
+    idempotency_key: str = Field(description="占用场次的原核验幂等键")
+    film_id: str
+    venue_id: str
+    start_time: str = Field(description="当前排片开场时刻（UTC，含改签）")
+    end_time: str = Field(description="占用结束时刻 = 开场 + 片长（左闭右开）")
+    assigned_at: str = Field(description="该场最近一次分配时间（UTC）")
+
+
+class CopyDetailOut(BaseModel):
+    id: int
+    film_id: str
+    copy_code: str
+    duration_minutes: int
+    transfer_minutes: int
+    created_at: str
+    occupancy: list[CopyOccupancyItem] = Field(
+        description="该拷贝当前全部占用场次（按当前排片开场时刻升序）"
+    )
+
+
+class CopyAssignRequest(BaseModel):
+    copy_code: str = Field(
+        min_length=1, max_length=128,
+        description="目标拷贝编号；须与场次同片",
+        examples=["COPY-AR-001"],
+    )
+
+    @field_validator("copy_code")
+    @classmethod
+    def _code_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("copy_code must not be blank")
+        return value
+
+
+class CopyAssignmentOut(BaseModel):
+    """一次分配/替换的结果；同场次同拷贝重试返回现状（replay=true）。"""
+
+    id: int = Field(description="分配记录编号（换拷贝原子替换时保持不变）")
+    idempotency_key: str = Field(description="场次的原核验幂等键")
+    verification_id: int
+    film_id: str
+    venue_id: str
+    copy_id: int
+    copy_code: str
+    start_time: str = Field(description="当前排片开场时刻（UTC）")
+    end_time: str = Field(description="占用结束时刻 = 开场 + 片长（左闭右开）")
+    previous_copy_id: Optional[int] = Field(description="被原子替换的原拷贝 id；首次分配为 null")
+    previous_copy_code: Optional[str] = Field(description="被原子替换的原拷贝编号；首次分配为 null")
+    assigned_at: str = Field(description="最近一次（重）分配时间（UTC）")
+    replay: bool = Field(
+        description="true 表示同场次同拷贝重试，返回现状，未重复落账"
+    )
+
+
+class CopyAssignmentStatusOut(BaseModel):
+    """某场次当前的拷贝分配状态；未分配时 assigned=false。"""
+
+    idempotency_key: str
+    verification_id: int
+    film_id: str
+    venue_id: str
+    assigned: bool
+    copy_id: Optional[int]
+    copy_code: Optional[str]
+    start_time: Optional[str] = Field(description="当前排片开场时刻；未分配为 null")
+    end_time: Optional[str] = Field(description="占用结束时刻；未分配为 null")
+    assigned_at: Optional[str]
+
+
+class CopyConflictItem(BaseModel):
+    """与候选时段冲突的一场既有占用（同拷贝）。"""
+
+    verification_id: int
+    idempotency_key: str
+    venue_id: str
+    start_time: str = Field(description="该场当前排片开场时刻（UTC）")
+    end_time: str = Field(description="该场占用结束时刻 = 开场 + 片长")
+
+
+class CopyConflictsOut(BaseModel):
+    """冲突预检：某拷贝在指定场馆/时段放映时会冲突的既有占用场次。"""
+
+    copy_id: int
+    copy_code: str
+    film_id: str
+    venue_id: str = Field(description="候选场馆")
+    start_time: str = Field(description="候选开场时刻（UTC）")
+    end_time: str = Field(description="候选占用结束时刻 = 开场 + 片长")
+    conflicts: list[CopyConflictItem]

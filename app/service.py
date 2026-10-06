@@ -43,6 +43,16 @@ RESCHEDULE_REASON_CODE_ISSUED = "OPENING_CODE_ALREADY_ISSUED"  # 已领开场码
 RESCHEDULE_REASON_PAST_TARGET = "NEW_START_NOT_IN_FUTURE"    # 新开场时刻不晚于当前时刻
 RESCHEDULE_REASON_SAME_TARGET = "NEW_START_UNCHANGED"        # 新开场时刻与当前排片相同
 
+# 实体拷贝：改签特有的拒绝原因（落 decision='rejected' 改签流水，排片/分配/额度不变）
+REASON_COPY_CONFLICT = "COPY_CONFLICT"  # 新时段与同拷贝既有占用冲突（重叠/转运不足）
+
+# 实体拷贝登记 / 分配的业务错误码
+COPY_REASON_HAS_APPROVED = "FILM_HAS_APPROVED_VERIFICATIONS"  # 影片已有核准流水，不可再登记拷贝
+COPY_REASON_FILM_MISMATCH = "COPY_FILM_MISMATCH"      # 拷贝与场次不同片
+COPY_REASON_ASSIGNMENT_REQUIRED = "COPY_ASSIGNMENT_REQUIRED"  # 已配置拷贝的影片领码前须先分配
+COPY_CODE_CONFLICT = "COPY_CONFLICT"                  # 分配与既有占用冲突（409，不落账）
+COPY_CODE_NOT_FOUND = "COPY_NOT_FOUND"                # 拷贝编号未知（404）
+
 # 已取消的核准流水不再占用授权/池额度：取消登记后实时已用次数回退，
 # 释放出的额度可被后续核验使用；原核验行及其快照保持原样。
 _ACTIVE_APPROVED = """
@@ -184,11 +194,16 @@ class ConflictError(Exception):
     """409 — e.g. idempotency key reused with a different payload."""
 
     def __init__(self, message: str, existing: Optional[dict] = None,
-                 index: Optional[int] = None):
+                 index: Optional[int] = None, code: str = "CONFLICT",
+                 extra: Optional[dict] = None):
         super().__init__(message)
         self.existing = existing
         # 批量核验时指出发生冲突的输入位置（从 0 开始）；单场核验为 None
         self.index = index
+        # 细分错误码：幂等键/操作键冲突沿用 CONFLICT，拷贝占用冲突为 COPY_CONFLICT
+        self.code = code
+        # 附加到 409 响应体的扩展字段（如拷贝冲突时的 conflicts 列表）
+        self.extra = extra or {}
 
 
 class NotFoundError(Exception):
@@ -440,6 +455,53 @@ def _reschedule_out(row: sqlite3.Row, replay: bool) -> dict:
         "pool_remaining_quota": row["new_pool_remaining_quota"] if approved else None,
         "reason": row["reason"],
         "rescheduled_at": row["rescheduled_at"],
+        "replay": replay,
+    }
+
+
+def _copy_out(copy_row: sqlite3.Row, profile_row: sqlite3.Row, *,
+              replay: bool) -> dict:
+    """Copy record joined with its film-level profile."""
+    return {
+        "id": copy_row["id"],
+        "film_id": copy_row["film_id"],
+        "copy_code": copy_row["copy_code"],
+        "duration_minutes": profile_row["duration_minutes"],
+        "transfer_minutes": profile_row["transfer_minutes"],
+        "created_at": copy_row["created_at"],
+        "replay": replay,
+    }
+
+
+def _assignment_out_window(verification_row: sqlite3.Row,
+                       profile_row: sqlite3.Row) -> tuple:
+    """(start_iso, end_iso) occupancy window derived from the current schedule."""
+    start_iso = verification_row["eff_start_time"]
+    end_iso = to_iso(
+        parse_iso(start_iso) + timedelta(minutes=profile_row["duration_minutes"])
+    )
+    return start_iso, end_iso
+
+
+def _assignment_out(*, assignment_id: int, verification: sqlite3.Row,
+                    copy: sqlite3.Row, profile: sqlite3.Row,
+                    assigned_at: str, replay: bool,
+                    previous: Optional[dict] = None) -> dict:
+    """Copy-assignment payload; window follows the current schedule."""
+    start_iso, end_iso = _assignment_out_window(verification, profile)
+    return {
+        "id": assignment_id,
+        "idempotency_key": verification["idempotency_key"],
+        "verification_id": verification["id"],
+        "film_id": verification["film_id"],
+        "venue_id": verification["venue_id"],
+        "copy_id": copy["id"],
+        "copy_code": copy["copy_code"],
+        "start_time": start_iso,
+        "end_time": end_iso,
+        "previous_copy_id": previous["copy_id"] if previous else None,
+        "previous_copy_code": previous["copy_code"] if previous else None,
+        "assigned_at": assigned_at,
         "replay": replay,
     }
 
@@ -1199,6 +1261,12 @@ class Store:
                     """,
                     (verification["id"], idempotency_key, reason, cancelled_at),
                 )
+                # 取消即释放实体拷贝分配：同事务删除分配行，占用区间随之消失，
+                # 释放出的拷贝时段立即可被其他场次分配
+                conn.execute(
+                    "DELETE FROM copy_assignments WHERE verification_id = ?",
+                    (verification["id"],),
+                )
                 conn.execute("COMMIT")
                 return {
                     "id": cur.lastrowid,
@@ -1392,6 +1460,40 @@ class Store:
                     remaining, pool_remaining,
                 ) = _decide(adjusted, new_start_iso, suspended_ids)
 
+                # 已分配实体拷贝的场次：新时段必须与该拷贝的既有占用兼容
+                # （同场馆不重叠、跨场馆留足转运分钟，边界恰好满足可用）。
+                # 冲突则改签被拒（落 rejected 流水），排片、分配与额度均不变。
+                if decision == DECISION_APPROVED:
+                    assignment = conn.execute(
+                        """
+                        SELECT a.copy_id AS copy_id
+                        FROM copy_assignments a
+                        WHERE a.verification_id = ?
+                        """,
+                        (verification["id"],),
+                    ).fetchone()
+                    if assignment is not None:
+                        copy_profile = conn.execute(
+                            "SELECT * FROM film_copy_profiles WHERE film_id = ?",
+                            (verification["film_id"],),
+                        ).fetchone()
+                        copy_conflicts = self._copy_conflicts(
+                            conn,
+                            copy_id=assignment["copy_id"],
+                            venue_id=verification["venue_id"],
+                            start_iso=new_start_iso,
+                            duration_minutes=copy_profile["duration_minutes"],
+                            transfer_minutes=copy_profile["transfer_minutes"],
+                            exclude_verification_id=verification["id"],
+                        )
+                        if copy_conflicts:
+                            decision = DECISION_REJECTED
+                            license_id = None
+                            pool_id = None
+                            reason_code = REASON_COPY_CONFLICT
+                            remaining = None
+                            pool_remaining = None
+
                 from_license_id = cur_license_id
                 from_pool_id = cur_pool_id
                 rescheduled_at = now
@@ -1464,6 +1566,530 @@ class Store:
         with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [_reschedule_out(r, replay=False) for r in rows]
+
+    # ------------------------------------------------------------------
+    # physical copies: film-level profile, copy registry, session assignment
+    # ------------------------------------------------------------------
+    def register_copy(
+        self,
+        film_id: str,
+        *,
+        duration_minutes: int,
+        transfer_minutes: int,
+        copy_code: str,
+    ) -> dict:
+        """Register a physical copy for a film (idempotent per copy code).
+
+        The first copy of a film also fixes the film-level profile
+        (positive duration, non-negative cross-venue transfer minutes);
+        later copies of the same film must repeat the same profile values.
+        Registration is only possible while the film has **no approved
+        verification flow** (cancelled ones included).  Re-registering the
+        same copy code with the same profile replays the stored record
+        (``replay=True``); a code already taken, or a profile mismatch,
+        conflicts (409).  Runs under ``BEGIN IMMEDIATE`` so concurrent
+        registrations and verifications serialise.
+        """
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                existing_copy = conn.execute(
+                    "SELECT * FROM film_copies WHERE copy_code = ?", (copy_code,)
+                ).fetchone()
+                if existing_copy is not None:
+                    profile = conn.execute(
+                        "SELECT * FROM film_copy_profiles WHERE film_id = ?",
+                        (existing_copy["film_id"],),
+                    ).fetchone()
+                    if (
+                        existing_copy["film_id"] == film_id
+                        and profile is not None
+                        and profile["duration_minutes"] == duration_minutes
+                        and profile["transfer_minutes"] == transfer_minutes
+                    ):
+                        conn.execute("COMMIT")
+                        return _copy_out(existing_copy, profile, replay=True)
+                    conn.execute("ROLLBACK")
+                    raise ConflictError(
+                        f"copy code '{copy_code}' is already registered",
+                        existing=_copy_out(existing_copy, profile, replay=True),
+                        code="COPY_CODE_CONFLICT",
+                    )
+
+                approved = conn.execute(
+                    """
+                    SELECT 1 FROM verifications
+                    WHERE film_id = ? AND decision = 'approved' LIMIT 1
+                    """,
+                    (film_id,),
+                ).fetchone()
+                if approved is not None:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"film '{film_id}' already has approved verifications "
+                        "and can no longer register copies",
+                        code=COPY_REASON_HAS_APPROVED,
+                    )
+
+                profile = conn.execute(
+                    "SELECT * FROM film_copy_profiles WHERE film_id = ?",
+                    (film_id,),
+                ).fetchone()
+                if profile is None:
+                    conn.execute(
+                        """
+                        INSERT INTO film_copy_profiles
+                            (film_id, duration_minutes, transfer_minutes, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (film_id, duration_minutes, transfer_minutes, now_iso()),
+                    )
+                    profile = conn.execute(
+                        "SELECT * FROM film_copy_profiles WHERE film_id = ?",
+                        (film_id,),
+                    ).fetchone()
+                elif (
+                    profile["duration_minutes"] != duration_minutes
+                    or profile["transfer_minutes"] != transfer_minutes
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ConflictError(
+                        f"film '{film_id}' copy profile is already fixed at "
+                        f"duration={profile['duration_minutes']}min, "
+                        f"transfer={profile['transfer_minutes']}min",
+                        existing={
+                            "film_id": film_id,
+                            "duration_minutes": profile["duration_minutes"],
+                            "transfer_minutes": profile["transfer_minutes"],
+                        },
+                        code="COPY_PROFILE_MISMATCH",
+                    )
+
+                created_at = now_iso()
+                cur = conn.execute(
+                    """
+                    INSERT INTO film_copies (film_id, copy_code, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (film_id, copy_code, created_at),
+                )
+                copy_row = conn.execute(
+                    "SELECT * FROM film_copies WHERE id = ?", (cur.lastrowid,)
+                ).fetchone()
+                conn.execute("COMMIT")
+                return _copy_out(copy_row, profile, replay=False)
+            except (ConflictError, UnprocessableError):
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def get_film_copies(self, film_id: str) -> dict:
+        """Film-level copy profile plus the list of registered copies."""
+        with self._connection() as conn:
+            profile = conn.execute(
+                "SELECT * FROM film_copy_profiles WHERE film_id = ?", (film_id,)
+            ).fetchone()
+            rows = conn.execute(
+                "SELECT * FROM film_copies WHERE film_id = ? ORDER BY id ASC",
+                (film_id,),
+            ).fetchall()
+        return {
+            "film_id": film_id,
+            "configured": profile is not None,
+            "duration_minutes": (
+                profile["duration_minutes"] if profile is not None else None
+            ),
+            "transfer_minutes": (
+                profile["transfer_minutes"] if profile is not None else None
+            ),
+            "copies": [
+                {
+                    "id": r["id"],
+                    "copy_code": r["copy_code"],
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ],
+        }
+
+    # 拷贝当前占用：分配行联出场次的当前排片开场时刻（含改签），
+    # 占用区间 [start, start+片长) 在输出时派生，不落地存储。
+    _COPY_OCCUPANCY_SELECT = f"""
+    SELECT
+        a.id              AS assignment_id,
+        a.assigned_at     AS assigned_at,
+        v.id              AS verification_id,
+        v.idempotency_key AS idempotency_key,
+        v.film_id         AS film_id,
+        v.venue_id        AS venue_id,
+        {_EFFECTIVE_START_EXPR} AS start_time
+    FROM copy_assignments a
+    JOIN verifications v ON v.id = a.verification_id
+    """
+
+    def get_copy(self, copy_code: str) -> dict:
+        """Copy detail plus its current occupancy (derived from schedules)."""
+        with self._connection() as conn:
+            copy = conn.execute(
+                "SELECT * FROM film_copies WHERE copy_code = ?", (copy_code,)
+            ).fetchone()
+            if copy is None:
+                raise NotFoundError(
+                    f"copy '{copy_code}' not found", code=COPY_CODE_NOT_FOUND
+                )
+            profile = conn.execute(
+                "SELECT * FROM film_copy_profiles WHERE film_id = ?",
+                (copy["film_id"],),
+            ).fetchone()
+            rows = conn.execute(
+                self._COPY_OCCUPANCY_SELECT
+                + " WHERE a.copy_id = ? ORDER BY start_time ASC",
+                (copy["id"],),
+            ).fetchall()
+        duration = profile["duration_minutes"]
+        return {
+            "id": copy["id"],
+            "film_id": copy["film_id"],
+            "copy_code": copy["copy_code"],
+            "duration_minutes": duration,
+            "transfer_minutes": profile["transfer_minutes"],
+            "created_at": copy["created_at"],
+            "occupancy": [
+                {
+                    "verification_id": r["verification_id"],
+                    "idempotency_key": r["idempotency_key"],
+                    "film_id": r["film_id"],
+                    "venue_id": r["venue_id"],
+                    "start_time": r["start_time"],
+                    "end_time": to_iso(
+                        parse_iso(r["start_time"]) + timedelta(minutes=duration)
+                    ),
+                    "assigned_at": r["assigned_at"],
+                }
+                for r in rows
+            ],
+        }
+
+    @staticmethod
+    def _copy_conflicts(
+        conn: sqlite3.Connection,
+        *,
+        copy_id: int,
+        venue_id: str,
+        start_iso: str,
+        duration_minutes: int,
+        transfer_minutes: int,
+        exclude_verification_id: Optional[int] = None,
+    ) -> list:
+        """Occupancy conflicts of one copy against a candidate slot.
+
+        Every assignment occupies ``[start, start+duration)`` of the
+        *current* schedule.  Same-venue pairs must not overlap; cross-venue
+        pairs must additionally leave ``transfer_minutes`` between them —
+        an exactly touching boundary is usable.  The candidate's own
+        verification (when re-checking a swap or a reschedule) is excluded.
+        """
+        rows = conn.execute(
+            f"""
+            SELECT
+                a.verification_id AS verification_id,
+                v.idempotency_key AS idempotency_key,
+                v.venue_id        AS venue_id,
+                {_EFFECTIVE_START_EXPR} AS start_time
+            FROM copy_assignments a
+            JOIN verifications v ON v.id = a.verification_id
+            WHERE a.copy_id = ? AND v.id IS NOT ?
+            ORDER BY start_time ASC
+            """,
+            (copy_id, exclude_verification_id or -1),
+        ).fetchall()
+        start = parse_iso(start_iso)
+        end = start + timedelta(minutes=duration_minutes)
+        conflicts = []
+        for row in rows:
+            other_start = parse_iso(row["start_time"])
+            other_end = other_start + timedelta(minutes=duration_minutes)
+            gap = (
+                timedelta(0)
+                if row["venue_id"] == venue_id
+                else timedelta(minutes=transfer_minutes)
+            )
+            if start < other_end + gap and other_start < end + gap:
+                conflicts.append(
+                    {
+                        "verification_id": row["verification_id"],
+                        "idempotency_key": row["idempotency_key"],
+                        "venue_id": row["venue_id"],
+                        "start_time": row["start_time"],
+                        "end_time": to_iso(other_end),
+                    }
+                )
+        return conflicts
+
+    def assign_copy(self, idempotency_key: str, *, copy_code: str) -> dict:
+        """Assign a same-film copy to an approved, live, not-started session.
+
+        The whole check-and-write runs in one ``BEGIN IMMEDIATE``
+        transaction, so concurrent assignments can never oversell a copy:
+        a conflicting candidate slot (same-venue overlap or insufficient
+        cross-venue transfer gap) is rejected with 409 ``COPY_CONFLICT``
+        and **nothing is persisted**.  Re-assigning the same copy to the
+        same session returns the current state (``replay=True``); assigning
+        a different copy atomically replaces the current row in the same
+        transaction (the old copy's occupancy is released as the new one
+        is taken).
+        """
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                verification = conn.execute(
+                    f"""
+                    SELECT v.*, {_EFFECTIVE_START_EXPR} AS eff_start_time
+                    FROM verifications v
+                    WHERE v.idempotency_key = ?
+                    """,
+                    (idempotency_key,),
+                ).fetchone()
+                if verification is None:
+                    conn.execute("ROLLBACK")
+                    raise NotFoundError(
+                        f"verification '{idempotency_key}' not found"
+                    )
+                copy = conn.execute(
+                    "SELECT * FROM film_copies WHERE copy_code = ?", (copy_code,)
+                ).fetchone()
+                if copy is None:
+                    conn.execute("ROLLBACK")
+                    raise NotFoundError(
+                        f"copy '{copy_code}' not found", code=COPY_CODE_NOT_FOUND
+                    )
+                profile = conn.execute(
+                    "SELECT * FROM film_copy_profiles WHERE film_id = ?",
+                    (copy["film_id"],),
+                ).fetchone()
+
+                existing = conn.execute(
+                    """
+                    SELECT a.id AS assignment_id, a.copy_id AS copy_id,
+                           a.assigned_at AS assigned_at,
+                           fc.copy_code AS copy_code
+                    FROM copy_assignments a
+                    JOIN film_copies fc ON fc.id = a.copy_id
+                    WHERE a.verification_id = ?
+                    """,
+                    (verification["id"],),
+                ).fetchone()
+                # 同场次同拷贝重试：直接返回现状，不重复落账（即使此后已开场）
+                if existing is not None and existing["copy_id"] == copy["id"]:
+                    conn.execute("COMMIT")
+                    return _assignment_out(
+                        assignment_id=existing["assignment_id"],
+                        verification=verification,
+                        copy=copy,
+                        profile=profile,
+                        assigned_at=existing["assigned_at"],
+                        replay=True,
+                    )
+
+                if verification["decision"] != DECISION_APPROVED:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"verification '{idempotency_key}' was rejected and "
+                        "cannot be assigned a copy",
+                        code=CODE_REASON_NOT_APPROVED,
+                    )
+                cancelled = conn.execute(
+                    "SELECT 1 FROM cancellations WHERE verification_id = ?",
+                    (verification["id"],),
+                ).fetchone()
+                if cancelled is not None:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"screening '{idempotency_key}' is cancelled and "
+                        "cannot be assigned a copy",
+                        code=CODE_REASON_CANCELLED,
+                    )
+                # 仅未开场的场次可分配/换拷贝（按当前排片判定）
+                if verification["eff_start_time"] <= now_iso():
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"screening '{idempotency_key}' has already started "
+                        "and cannot be assigned a copy",
+                        code=CODE_REASON_ALREADY_STARTED,
+                    )
+                if copy["film_id"] != verification["film_id"]:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"copy '{copy_code}' belongs to film "
+                        f"'{copy['film_id']}', not '{verification['film_id']}'",
+                        code=COPY_REASON_FILM_MISMATCH,
+                    )
+
+                conflicts = self._copy_conflicts(
+                    conn,
+                    copy_id=copy["id"],
+                    venue_id=verification["venue_id"],
+                    start_iso=verification["eff_start_time"],
+                    duration_minutes=profile["duration_minutes"],
+                    transfer_minutes=profile["transfer_minutes"],
+                    exclude_verification_id=verification["id"],
+                )
+                if conflicts:
+                    conn.execute("ROLLBACK")
+                    raise ConflictError(
+                        f"copy '{copy_code}' cannot cover the slot: "
+                        f"{len(conflicts)} conflicting assignment(s)",
+                        code=COPY_CODE_CONFLICT,
+                        extra={"conflicts": conflicts},
+                    )
+
+                assigned_at = now_iso()
+                previous = None
+                if existing is not None:
+                    # 换拷贝：同一事务内原子替换（旧拷贝占用随本行更新即释放）
+                    previous = {
+                        "copy_id": existing["copy_id"],
+                        "copy_code": existing["copy_code"],
+                    }
+                    conn.execute(
+                        """
+                        UPDATE copy_assignments
+                        SET copy_id = ?, assigned_at = ?
+                        WHERE verification_id = ?
+                        """,
+                        (copy["id"], assigned_at, verification["id"]),
+                    )
+                    assignment_id = existing["assignment_id"]
+                else:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO copy_assignments
+                            (verification_id, copy_id, assigned_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (verification["id"], copy["id"], assigned_at),
+                    )
+                    assignment_id = cur.lastrowid
+                conn.execute("COMMIT")
+                return _assignment_out(
+                    assignment_id=assignment_id,
+                    verification=verification,
+                    copy=copy,
+                    profile=profile,
+                    assigned_at=assigned_at,
+                    replay=False,
+                    previous=previous,
+                )
+            except (NotFoundError, ConflictError, UnprocessableError):
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def get_copy_assignment(self, idempotency_key: str) -> dict:
+        """Current copy assignment of one verification (assigned flag)."""
+        with self._connection() as conn:
+            verification = conn.execute(
+                f"""
+                SELECT v.*, {_EFFECTIVE_START_EXPR} AS eff_start_time
+                FROM verifications v
+                WHERE v.idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if verification is None:
+                raise NotFoundError(
+                    f"verification '{idempotency_key}' not found"
+                )
+            row = conn.execute(
+                """
+                SELECT a.id AS assignment_id, a.assigned_at AS assigned_at,
+                       a.copy_id AS copy_id, fc.copy_code AS copy_code,
+                       fc.film_id AS copy_film_id
+                FROM copy_assignments a
+                JOIN film_copies fc ON fc.id = a.copy_id
+                WHERE a.verification_id = ?
+                """,
+                (verification["id"],),
+            ).fetchone()
+            if row is None:
+                return {
+                    "idempotency_key": idempotency_key,
+                    "verification_id": verification["id"],
+                    "film_id": verification["film_id"],
+                    "venue_id": verification["venue_id"],
+                    "assigned": False,
+                    "copy_id": None,
+                    "copy_code": None,
+                    "start_time": None,
+                    "end_time": None,
+                    "assigned_at": None,
+                }
+            profile = conn.execute(
+                "SELECT * FROM film_copy_profiles WHERE film_id = ?",
+                (row["copy_film_id"],),
+            ).fetchone()
+        end = parse_iso(verification["eff_start_time"]) + timedelta(
+            minutes=profile["duration_minutes"]
+        )
+        return {
+            "idempotency_key": idempotency_key,
+            "verification_id": verification["id"],
+            "film_id": verification["film_id"],
+            "venue_id": verification["venue_id"],
+            "assigned": True,
+            "copy_id": row["copy_id"],
+            "copy_code": row["copy_code"],
+            "start_time": verification["eff_start_time"],
+            "end_time": to_iso(end),
+            "assigned_at": row["assigned_at"],
+        }
+
+    def check_copy_conflicts(
+        self, copy_code: str, *, venue_id: str, start_time: datetime
+    ) -> dict:
+        """Preview which current assignments of a copy would conflict with a
+        candidate venue/slot (read-only; same rules as assignment)."""
+        start_iso = to_iso(start_time)
+        with self._connection() as conn:
+            copy = conn.execute(
+                "SELECT * FROM film_copies WHERE copy_code = ?", (copy_code,)
+            ).fetchone()
+            if copy is None:
+                raise NotFoundError(
+                    f"copy '{copy_code}' not found", code=COPY_CODE_NOT_FOUND
+                )
+            profile = conn.execute(
+                "SELECT * FROM film_copy_profiles WHERE film_id = ?",
+                (copy["film_id"],),
+            ).fetchone()
+            conflicts = self._copy_conflicts(
+                conn,
+                copy_id=copy["id"],
+                venue_id=venue_id,
+                start_iso=start_iso,
+                duration_minutes=profile["duration_minutes"],
+                transfer_minutes=profile["transfer_minutes"],
+            )
+        end = parse_iso(start_iso) + timedelta(
+            minutes=profile["duration_minutes"]
+        )
+        return {
+            "copy_id": copy["id"],
+            "copy_code": copy["copy_code"],
+            "film_id": copy["film_id"],
+            "venue_id": venue_id,
+            "start_time": start_iso,
+            "end_time": to_iso(end),
+            "conflicts": conflicts,
+        }
 
     # ------------------------------------------------------------------
     # one-time opening codes and venue redemption
@@ -1548,6 +2174,25 @@ class Store:
                         "and no opening code can be claimed",
                         code=CODE_REASON_ALREADY_STARTED,
                     )
+                # 已配置实体拷贝的影片：领码前须已有有效拷贝分配；
+                # 未配置拷贝的影片沿用旧行为，不做此检查
+                copy_profiled = conn.execute(
+                    "SELECT 1 FROM film_copy_profiles WHERE film_id = ?",
+                    (verification["film_id"],),
+                ).fetchone()
+                if copy_profiled is not None:
+                    assigned = conn.execute(
+                        "SELECT 1 FROM copy_assignments WHERE verification_id = ?",
+                        (verification["id"],),
+                    ).fetchone()
+                    if assigned is None:
+                        conn.execute("ROLLBACK")
+                        raise UnprocessableError(
+                            f"film '{verification['film_id']}' has physical "
+                            "copies configured; assign a copy before claiming "
+                            "the opening code",
+                            code=COPY_REASON_ASSIGNMENT_REQUIRED,
+                        )
 
                 issued_at = now_iso()
                 code = self._generate_opening_code(conn)

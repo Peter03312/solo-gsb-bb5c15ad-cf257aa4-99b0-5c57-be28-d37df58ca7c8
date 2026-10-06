@@ -15,7 +15,15 @@ from .schemas import (
     BatchVerifyResponse,
     CancelOut,
     CancelRequest,
+    CopyAssignmentOut,
+    CopyAssignmentStatusOut,
+    CopyAssignRequest,
+    CopyConflictsOut,
+    CopyDetailOut,
+    CopyOut,
+    CopyRegisterRequest,
     CurrentVerificationOut,
+    FilmCopiesOut,
     LicenseCreate,
     LicenseOut,
     OpeningCodeOut,
@@ -75,17 +83,18 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.5.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销与核准场次改签",
+        version="1.6.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销、核准场次改签与实体放映拷贝分配",
         lifespan=lifespan,
     )
     app.state.store = store
 
     @app.exception_handler(ConflictError)
     async def _conflict_handler(request: Request, exc: ConflictError):
-        content = {"detail": str(exc), "code": "CONFLICT", "existing": exc.existing}
+        content = {"detail": str(exc), "code": exc.code, "existing": exc.existing}
         if exc.index is not None:
             content["index"] = exc.index
+        content.update(exc.extra)
         return JSONResponse(status_code=409, content=content)
 
     @app.exception_handler(NotFoundError)
@@ -441,6 +450,99 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
           资格，也不改变原核验结果与额度/池占用。
         """
         return store.redeem_opening_code(code=body.code, venue_id=body.venue_id)
+
+    # ------------------------------------------------------------------
+    # physical copies: film profile + registry, assignment, occupancy
+    # ------------------------------------------------------------------
+    @app.post(
+        "/films/{film_id}/copies",
+        response_model=CopyOut,
+        status_code=201,
+        tags=["copies"],
+    )
+    def register_copy(film_id: str, body: CopyRegisterRequest):
+        """为影片登记一份实体放映拷贝（幂等）。
+
+        - 仅可在该影片**尚无核准流水**（含已取消的核准流水）时登记；
+          首份拷贝同时固定影片级配置：正整数片长 + 非负跨场馆转运分钟数，
+          之后同片登记必须重复相同配置值，否则 409 COPY_PROFILE_MISMATCH；
+        - 拷贝编号全库唯一：同编号同参数重登返回既有记录（replay=true），
+          编号被占用或参数不符返回 409 COPY_CODE_CONFLICT；
+        - 影片已有核准流水时登记返回 422 FILM_HAS_APPROVED_VERIFICATIONS。
+        """
+        return store.register_copy(
+            film_id,
+            duration_minutes=body.duration_minutes,
+            transfer_minutes=body.transfer_minutes,
+            copy_code=body.copy_code,
+        )
+
+    @app.get(
+        "/films/{film_id}/copies",
+        response_model=FilmCopiesOut,
+        tags=["copies"],
+    )
+    def list_film_copies(film_id: str):
+        """查询影片的拷贝配置（片长/转运分钟）与已登记拷贝清单。
+
+        未配置时 configured=false；未配置拷贝的影片领开场码沿用旧行为。
+        """
+        return store.get_film_copies(film_id)
+
+    @app.get("/copies/{copy_code}", response_model=CopyDetailOut, tags=["copies"])
+    def get_copy(copy_code: str):
+        """查询单份拷贝详情与当前占用：各占用场次按当前排片（含改签）
+        派生占用区间 [开场, 开场+片长)，按开场时刻升序。未知编号 404。"""
+        return store.get_copy(copy_code)
+
+    @app.get(
+        "/copies/{copy_code}/conflicts",
+        response_model=CopyConflictsOut,
+        tags=["copies"],
+    )
+    def check_copy_conflicts(
+        copy_code: str,
+        venue_id: str = Query(min_length=1, max_length=128),
+        start_time: datetime = Query(
+            description="候选开场时刻，ISO-8601；不带时区按 UTC 处理"
+        ),
+    ):
+        """冲突预检：该拷贝若在指定场馆/时段放映，会与哪些既有占用冲突。
+
+        判定与分配一致：同场馆占用区间不得重叠，跨场馆两场之间须留足
+        转运分钟数，恰好满足边界可用。只读，不产生任何记录。
+        """
+        return store.check_copy_conflicts(
+            copy_code, venue_id=venue_id, start_time=start_time
+        )
+
+    @app.post(
+        "/verifications/{idempotency_key}/copy-assignment",
+        response_model=CopyAssignmentOut,
+        tags=["copies"],
+    )
+    def assign_copy(idempotency_key: str, body: CopyAssignRequest):
+        """为已核准、未取消、未开场的场次指定同片拷贝（幂等）。
+
+        - 每份拷贝按当前排片占用 [开场, 开场+片长)：同场馆时段不得重叠，
+          跨场馆两场之间须留足转运分钟数（恰好满足边界可用）；
+        - 冲突返回 409 COPY_CONFLICT（响应带 conflicts 冲突场次列表），
+          **不落任何记录**；
+        - 同场次同拷贝重试返回现状（replay=true）；指定不同拷贝时在同一
+          事务内原子替换（旧拷贝占用随替换释放）；
+        - 未知核验键 404 NOT_FOUND，未知拷贝编号 404 COPY_NOT_FOUND；
+          已拒绝/已取消/已开场/异片拷贝分别 422。
+        """
+        return store.assign_copy(idempotency_key, copy_code=body.copy_code)
+
+    @app.get(
+        "/verifications/{idempotency_key}/copy-assignment",
+        response_model=CopyAssignmentStatusOut,
+        tags=["copies"],
+    )
+    def get_copy_assignment(idempotency_key: str):
+        """查询场次当前的拷贝分配状态；未分配时 assigned=false。未知键 404。"""
+        return store.get_copy_assignment(idempotency_key)
 
     return app
 
